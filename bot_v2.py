@@ -12,6 +12,7 @@ Usage:
     python weatherbet.py status   # balance and open positions
 """
 
+import os
 import re
 import sys
 import json
@@ -28,6 +29,16 @@ from pathlib import Path
 with open("config.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
+
+def _env_int(key, default):
+    raw = os.getenv(key)
+    if raw in (None, ""):
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
 BALANCE          = _cfg.get("balance", 10000.0)
 MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
 MIN_EV           = _cfg.get("min_ev", 0.10)
@@ -37,9 +48,20 @@ MIN_HOURS        = _cfg.get("min_hours", 2.0)
 MAX_HOURS        = _cfg.get("max_hours", 72.0)
 KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
-SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
+SCAN_INTERVAL    = _env_int("WEATHERBOT_SCAN_INTERVAL", _cfg.get("scan_interval", 3600))   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
-VC_KEY           = _cfg.get("vc_key", "")
+VC_KEY           = os.getenv("WEATHERBOT_VC_KEY", _cfg.get("vc_key", ""))
+
+# Known placeholder values from README / config.json.template — do not treat as secrets
+PLACEHOLDER_VC_KEYS = frozenset({
+    "", "YOUR_KEY_HERE", "YOUR_VISUAL_CROSSING_KEY",
+})
+
+
+def vc_key_configured():
+    k = str(VC_KEY).strip()
+    return bool(k and k not in PLACEHOLDER_VC_KEYS)
+
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -139,7 +161,10 @@ def get_sigma(city_slug, source="ecmwf"):
 
 def run_calibration(markets):
     """Recalculates sigma from resolved markets."""
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
+    resolved = [
+        m for m in markets
+        if m.get("status") == "resolved" and m.get("actual_temp") is not None
+    ]
     cal = load_cal()
     updated = []
 
@@ -148,10 +173,14 @@ def run_calibration(markets):
             group = [m for m in resolved if m["city"] == city]
             errors = []
             for m in group:
-                snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s["source"] == source), None)
-                if snap and snap.get("temp") is not None:
-                    errors.append(abs(snap["temp"] - m["actual_temp"]))
+                snap_temp = None
+                for s in reversed(m.get("forecast_snapshots", [])):
+                    v = s.get(source)
+                    if v is not None:
+                        snap_temp = float(v)
+                        break
+                if snap_temp is not None:
+                    errors.append(abs(snap_temp - float(m["actual_temp"])))
             if len(errors) < CALIBRATION_MIN:
                 continue
             mae  = sum(errors) / len(errors)
@@ -407,6 +436,31 @@ def load_state():
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
+
+def reconcile_state(state=None):
+    if state is None:
+        state = load_state()
+
+    markets = load_all_markets()
+    positions = [m["position"] for m in markets if m.get("position")]
+    open_positions = [p for p in positions if p.get("status") == "open"]
+    closed_positions = [p for p in positions if p.get("status") == "closed"]
+
+    starting_balance = state.get("starting_balance", BALANCE)
+    realized_pnl = sum(float(p.get("pnl") or 0.0) for p in closed_positions)
+    deployed_capital = sum(float(p.get("cost") or 0.0) for p in open_positions)
+    current_balance = round(starting_balance + realized_pnl - deployed_capital, 2)
+
+    return {
+        **state,
+        "balance": current_balance,
+        "starting_balance": starting_balance,
+        "total_trades": len(positions),
+        "wins": len([p for p in closed_positions if float(p.get("pnl") or 0.0) > 0]),
+        "losses": len([p for p in closed_positions if float(p.get("pnl") or 0.0) <= 0]),
+        "peak_balance": max(float(state.get("peak_balance", starting_balance)), current_balance),
+    }
+
 # =============================================================================
 # CORE LOGIC
 # =============================================================================
@@ -444,7 +498,7 @@ def scan_and_update():
     """Main function of one cycle: updates forecasts, opens/closes positions."""
     global _cal
     now      = datetime.now(timezone.utc)
-    state    = load_state()
+    state    = reconcile_state(load_state())
     balance  = state["balance"]
     new_pos  = 0
     closed   = 0
@@ -688,7 +742,10 @@ def scan_and_update():
             if hours < 0.5 and mkt["status"] == "open":
                 mkt["status"] = "closed"
 
+            state["balance"] = round(balance, 2)
+            state["peak_balance"] = max(state.get("peak_balance", balance), balance)
             save_market(mkt)
+            save_state(state)
             time.sleep(0.1)
 
         print("ok")
@@ -727,6 +784,12 @@ def scan_and_update():
         mkt["status"]       = "resolved"
         mkt["resolved_outcome"] = "win" if won else "loss"
 
+        mkt["actual_temp"] = None
+        if vc_key_configured():
+            at = get_actual_temp(mkt["city"], mkt["date"])
+            if at is not None:
+                mkt["actual_temp"] = at
+
         if won:
             state["wins"] += 1
         else:
@@ -736,7 +799,10 @@ def scan_and_update():
         print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
         resolved += 1
 
+        state["balance"] = round(balance, 2)
+        state["peak_balance"] = max(state.get("peak_balance", balance), balance)
         save_market(mkt)
+        save_state(state)
         time.sleep(0.3)
 
     state["balance"]      = round(balance, 2)
@@ -757,7 +823,7 @@ def scan_and_update():
 # =============================================================================
 
 def print_status():
-    state    = load_state()
+    state    = reconcile_state(load_state())
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
     resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
@@ -857,7 +923,7 @@ def print_report():
 # MAIN LOOP
 # =============================================================================
 
-MONITOR_INTERVAL = 600  # monitor positions every 10 minutes
+MONITOR_INTERVAL = _env_int("WEATHERBOT_MONITOR_INTERVAL", 600)  # monitor positions every 10 minutes
 
 def monitor_positions():
     """Quick stop check on open positions without full scan."""
@@ -866,7 +932,7 @@ def monitor_positions():
     if not open_pos:
         return 0
 
-    state   = load_state()
+    state   = reconcile_state(load_state())
     balance = state["balance"]
     closed  = 0
 
@@ -952,6 +1018,7 @@ def monitor_positions():
 def run_loop():
     global _cal
     _cal = load_cal()
+    save_state(reconcile_state(load_state()))
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STARTING")
