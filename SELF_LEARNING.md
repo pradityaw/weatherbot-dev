@@ -49,6 +49,16 @@ Supported values:
 - `WEATHERBOT_VC_KEY`
 - `WEATHERBOT_SCAN_INTERVAL`
 - `WEATHERBOT_MONITOR_INTERVAL`
+- `WEATHERBOT_LIVE_TRADING`
+- `WEATHERBOT_DRY_RUN_LIVE`
+- `WEATHERBOT_MAX_LIVE_USDC`
+- `WEATHERBOT_LIVE_TRADE_CAP_USDC`
+- `WEATHERBOT_MAX_OPEN_EXPOSURE_USDC`
+- `WEATHERBOT_MAX_DAILY_LOSS_USDC`
+- `WEATHERBOT_MAX_NEW_TRADES_PER_DAY`
+- `WEATHERBOT_LIVE_MAX_PRICE`
+- `WEATHERBOT_LIVE_MAX_SLIPPAGE`
+- `WEATHERBOT_KILL_SWITCH_FILE`
 
 ## launchd
 
@@ -116,5 +126,14 @@ Treat this as a gate. Do not skip straight to capital until every item is satisf
 ```bash
 ./status.sh           # balance + counts
 ./daily-check.sh      # status + recent log tail
+python paper_watch_review.py   # Paper Trading Watch daily bundle (status + precip + live tails)
+python verify_paper_watch.py # env check (paper mode + VC key)
+python check_precip_secondary.py   # Open-Meteo vs VC precip sanity check
 python bot_v2.py report
+python bot_v2.py live-status
+python bot_v2.py pause-live
+python bot_v2.py resume-live
+python check_live_wallet.py
 ```
+
+Paper Trading Watch checklist: [PAPER_WATCH.md](PAPER_WATCH.md).

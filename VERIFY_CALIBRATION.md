@@ -13,3 +13,16 @@
 3. `data/calibration.json` is only created/updated after enough resolved markets with `actual_temp` (see `calibration_min` in `config.json`).
 
 4. With no API key, `get_actual_temp` is never called, so you will see **no** `[VC]` lines — that is expected until you add a key and a market resolves.
+
+## Precipitation secondary source (Open-Meteo vs Visual Crossing)
+
+The precip scanner compares realized month-to-date totals from **Open-Meteo archive** with **Visual Crossing** timeline precipitation before marking `would_pass_gateway=True` (when `WEATHERBOT_PRECIP_SECONDARY_REQUIRED=true`).
+
+1. Set the same `WEATHERBOT_VC_KEY` in `.env.weatherbot` and restart the agent.
+2. Run a one-shot comparison (Seoul proxy, current month through yesterday):
+   ```bash
+   ./.venv/bin/python check_precip_secondary.py
+   ```
+3. If the key is missing, you will see `vc_key_missing` in `secondary_check` inside `data/precip_markets/*.json` and signals will not pass the gateway-ready flag.
+
+See also [PAPER_WATCH.md](PAPER_WATCH.md).

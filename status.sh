@@ -10,6 +10,8 @@ if [[ ! -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
 fi
 
 "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/bot_v2.py" status
+"$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/bot_v2.py" live-status
+"$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/bot_v2.py" precip-status
 
 "$SCRIPT_DIR/.venv/bin/python" <<'PY'
 import json

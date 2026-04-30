@@ -122,6 +122,16 @@ This data is used for self-calibration — the bot learns forecast accuracy per 
 
 ---
 
+## Paper Trading Watch
+
+Before promoting to shadow or live execution, follow the checklist in **[PAPER_WATCH.md](PAPER_WATCH.md)** (Visual Crossing key, 24–72h observation, daily review, shadow graduation criteria). Quick review:
+
+```bash
+./paper_watch_review.sh
+```
+
+---
+
 ## Disclaimer
 
 This is not financial advice. Prediction markets carry real risk. Run the simulation thoroughly before committing real capital.

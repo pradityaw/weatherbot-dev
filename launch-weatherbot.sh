@@ -31,4 +31,10 @@ if [ -f ".env.weatherbot" ]; then
   set +a
 fi
 
+if [ -f ".env.weatherbot-live" ]; then
+  set -a
+  source ".env.weatherbot-live"
+  set +a
+fi
+
 exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/bot_v2.py" run

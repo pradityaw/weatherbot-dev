@@ -144,6 +144,7 @@ ENV/
 env.bak/
 venv.bak/
 .env.weatherbot
+.env.weatherbot-live
 logs/
 data/
 
@@ -196,6 +197,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Node (e.g. tools/cursor-prelive)
+node_modules/
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to

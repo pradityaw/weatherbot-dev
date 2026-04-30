@@ -22,6 +22,11 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from clob_market import get_clob_market_snapshot
+from execution import ExecutionConfig, ExecutionGateway
+from precip_engine import scan_precip_and_log
+from signals import ExitSignal, TradeSignal
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -63,6 +68,16 @@ def vc_key_configured():
     return bool(k and k not in PLACEHOLDER_VC_KEYS)
 
 
+def send_live_alert(message: str):
+    webhook = os.getenv("WEATHERBOT_ALERT_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return
+    try:
+        requests.post(webhook, json={"text": message}, timeout=(3, 5))
+    except Exception:
+        pass
+
+
 SIGMA_F = 2.0
 SIGMA_C = 1.2
 
@@ -72,6 +87,15 @@ STATE_FILE       = DATA_DIR / "state.json"
 MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
 CALIBRATION_FILE = DATA_DIR / "calibration.json"
+
+_exec_gateway = None
+
+
+def get_execution_gateway():
+    global _exec_gateway
+    if _exec_gateway is None:
+        _exec_gateway = ExecutionGateway(Path.cwd(), ExecutionConfig.from_env())
+    return _exec_gateway
 
 LOCATIONS = {
     "nyc":          {"lat": 40.7772,  "lon":  -73.8726, "name": "New York City", "station": "KLGA", "unit": "F", "region": "us"},
@@ -340,6 +364,12 @@ def get_market_price(market_id):
     except Exception:
         return None
 
+
+def get_clob_yes_bid_ask(market_id):
+    snap = get_clob_market_snapshot(str(market_id))
+    yes = snap.get("yes") or {}
+    return yes.get("bid"), yes.get("ask"), yes.get("spread")
+
 def parse_temp_range(question):
     if not question: return None
     num = r'(-?\d+(?:\.\d+)?)'
@@ -494,9 +524,10 @@ def take_forecast_snapshot(city_slug, dates):
         snapshots[date] = snap
     return snapshots
 
-def scan_and_update():
+def scan_and_update(exec_gateway=None):
     """Main function of one cycle: updates forecasts, opens/closes positions."""
     global _cal
+    exec_gateway = exec_gateway or get_execution_gateway()
     now      = datetime.now(timezone.utc)
     state    = reconcile_state(load_state())
     balance  = state["balance"]
@@ -556,6 +587,7 @@ def scan_and_update():
                 outcomes.append({
                     "question":  question,
                     "market_id": mid,
+                    "condition_id": str(market.get("conditionId", "") or ""),
                     "range":     rng,
                     "bid":       round(bid, 4),
                     "ask":       round(ask, 4),
@@ -603,7 +635,8 @@ def scan_and_update():
                         break
 
                 if current_price is not None:
-                    current_price = o.get("bid", current_price)  # sell at bid
+                    clob_bid, _, _ = get_clob_yes_bid_ask(pos["market_id"])
+                    current_price = clob_bid if clob_bid is not None else o.get("bid", current_price)
                     entry = pos["entry_price"]
                     stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
 
@@ -614,10 +647,22 @@ def scan_and_update():
 
                     # Check stop
                     if current_price <= stop:
+                        exit_reason = "stop_loss" if current_price < entry else "trailing_stop"
+                        exit_signal = ExitSignal.from_position(
+                            city=city_slug,
+                            city_name=loc["name"],
+                            date=date,
+                            market_id=pos["market_id"],
+                            position=pos,
+                            current_price=current_price,
+                            close_reason=exit_reason,
+                            hours_left=hours,
+                        )
+                        exec_gateway.on_exit_signal(exit_signal)
                         pnl = round((current_price - entry) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         pos["closed_at"]    = snap.get("ts")
-                        pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
+                        pos["close_reason"] = exit_reason
                         pos["exit_price"]   = current_price
                         pos["pnl"]          = pnl
                         pos["status"]       = "closed"
@@ -642,6 +687,19 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
+                        clob_bid, _, _ = get_clob_yes_bid_ask(pos["market_id"])
+                        current_price = clob_bid if clob_bid is not None else current_price
+                        exit_signal = ExitSignal.from_position(
+                            city=city_slug,
+                            city_name=loc["name"],
+                            date=date,
+                            market_id=pos["market_id"],
+                            position=pos,
+                            current_price=current_price,
+                            close_reason="forecast_changed",
+                            hours_left=hours,
+                        )
+                        exec_gateway.on_exit_signal(exit_signal)
                         pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         mkt["position"]["closed_at"]    = snap.get("ts")
@@ -707,19 +765,23 @@ def scan_and_update():
                                 }
 
                 if best_signal:
-                    # Fetch real bestAsk from Polymarket API for accurate entry price
+                    # Fetch executable CLOB top of book for accurate entry price.
                     skip_position = False
                     try:
-                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
-                        mdata = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["bid_at_entry"]))
-                        real_spread = round(real_ask - real_bid, 4)
+                        real_bid, real_ask, real_spread = get_clob_yes_bid_ask(best_signal["market_id"])
+                        if real_ask is None or real_bid is None:
+                            print(f"  [SKIP] {loc['name']} {date} — missing CLOB top of book")
+                            skip_position = True
+                            real_spread = None
+                        else:
+                            real_ask = float(real_ask)
+                            real_bid = float(real_bid)
+                            real_spread = round(float(real_spread if real_spread is not None else real_ask - real_bid), 4)
                         # Re-check slippage and price with real values
-                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
+                        if not skip_position and (real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE):
                             print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
                             skip_position = True
-                        else:
+                        elif not skip_position:
                             best_signal["entry_price"]  = real_ask
                             best_signal["bid_at_entry"] = real_bid
                             best_signal["spread"]       = real_spread
@@ -727,8 +789,49 @@ def scan_and_update():
                             best_signal["ev"]           = round(calc_ev(best_signal["p"], real_ask), 4)
                     except Exception as e:
                         print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                        skip_position = True
 
                     if not skip_position and best_signal["entry_price"] < MAX_PRICE:
+                        try:
+                            from trader_research.trader_edge import maybe_log_trader_edge
+
+                            maybe_log_trader_edge(
+                                exec_gateway,
+                                city_slug=city_slug,
+                                date_str=date,
+                                matched_outcome=o,
+                                best_signal=best_signal,
+                            )
+                        except Exception:
+                            pass
+                        trade_signal = TradeSignal.from_best_signal(
+                            city=city_slug,
+                            city_name=loc["name"],
+                            date=date,
+                            best_signal=best_signal,
+                        )
+                        live_result = exec_gateway.on_entry_signal(trade_signal)
+                        live_reason = live_result.get("reason", "")
+                        if live_reason not in {"shadow_mode", "ok"}:
+                            print(f"  [LIVE] {loc['name']} {date} — {live_reason}")
+                        mode = exec_gateway.mode_label()
+                        gateway_passed = (
+                            mode == "PAPER"
+                            or live_result.get("submitted")
+                            or live_reason == "shadow_mode"
+                        )
+                        if not gateway_passed:
+                            print(
+                                f"  [SKIP] {loc['name']} {date} — gateway rejected; "
+                                "paper mirror not opened"
+                            )
+                            continue
+                        if live_result.get("submitted"):
+                            send_live_alert(
+                                f"weatherbot live entry submitted {loc['name']} {date} "
+                                f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym} "
+                                f"${best_signal['cost']:.2f}"
+                            )
                         balance -= best_signal["cost"]
                         mkt["position"] = best_signal
                         state["total_trades"] += 1
@@ -925,8 +1028,9 @@ def print_report():
 
 MONITOR_INTERVAL = _env_int("WEATHERBOT_MONITOR_INTERVAL", 600)  # monitor positions every 10 minutes
 
-def monitor_positions():
+def monitor_positions(exec_gateway=None):
     """Quick stop check on open positions without full scan."""
+    exec_gateway = exec_gateway or get_execution_gateway()
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
     if not open_pos:
@@ -940,12 +1044,10 @@ def monitor_positions():
         pos = mkt["position"]
         mid = pos["market_id"]
 
-        # Fetch real bestBid from Polymarket API — actual sell price
+        # Fetch executable CLOB best bid — actual sell price.
         current_price = None
         try:
-            r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
-            mdata = r.json()
-            best_bid = mdata.get("bestBid")
+            best_bid, _, _ = get_clob_yes_bid_ask(mid)
             if best_bid is not None:
                 current_price = float(best_bid)
         except Exception:
@@ -989,6 +1091,18 @@ def monitor_positions():
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
+            close_reason = "take_profit" if take_triggered else ("stop_loss" if current_price < entry else "trailing_stop")
+            exit_signal = ExitSignal.from_position(
+                city=mkt["city"],
+                city_name=city_name,
+                date=mkt["date"],
+                market_id=mid,
+                position=pos,
+                current_price=current_price,
+                close_reason=close_reason,
+                hours_left=hours_left,
+            )
+            exec_gateway.on_exit_signal(exit_signal)
             pnl = round((current_price - entry) * pos["shares"], 2)
             balance += pos["cost"] + pnl
             pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
@@ -1019,6 +1133,7 @@ def run_loop():
     global _cal
     _cal = load_cal()
     save_state(reconcile_state(load_state()))
+    exec_gateway = get_execution_gateway()
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STARTING")
@@ -1027,6 +1142,8 @@ def run_loop():
     print(f"  Balance:    ${BALANCE:,.0f} | Max bet: ${MAX_BET}")
     print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
     print(f"  Sources:    ECMWF + HRRR(US) + METAR(D+0)")
+    print(f"  Exec mode:  {exec_gateway.mode_label()} "
+          f"(live_flag={int(exec_gateway.cfg.live_trading_enabled)} dry_run={int(exec_gateway.cfg.dry_run_live)})")
     print(f"  Data:       {DATA_DIR.resolve()}")
     print(f"  Ctrl+C to stop\n")
 
@@ -1040,10 +1157,40 @@ def run_loop():
         if now_ts - last_full_scan >= SCAN_INTERVAL:
             print(f"[{now_str}] full scan...")
             try:
-                new_pos, closed, resolved = scan_and_update()
+                open_exposure = 0.0
+                for m in load_all_markets():
+                    pos = m.get("position") or {}
+                    if pos.get("status") == "open":
+                        open_exposure += float(pos.get("cost") or 0.0)
+                exec_gateway.ledger.log_event(
+                    {
+                        "event": "open_exposure_snapshot",
+                        "open_exposure": round(open_exposure, 2),
+                        "mode": exec_gateway.mode_label(),
+                    }
+                )
+                new_pos, closed, resolved = scan_and_update(exec_gateway=exec_gateway)
                 state = load_state()
                 print(f"  balance: ${state['balance']:,.2f} | "
                       f"new: {new_pos} | closed: {closed} | resolved: {resolved}")
+                if os.getenv("WEATHERBOT_PRECIP_ENABLED", "true").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    try:
+                        bal = float(state.get("balance", BALANCE))
+                        precip_n = scan_precip_and_log(
+                            now_iso=datetime.now(timezone.utc).isoformat(),
+                            balance=bal,
+                        )
+                        print(
+                            f"  precip: {precip_n} signal(s) logged "
+                            f"(ev>={MIN_EV}, paper-only)"
+                        )
+                    except Exception as exc:
+                        print(f"  precip scan error: {exc}")
                 last_full_scan = time.time()
             except KeyboardInterrupt:
                 print(f"\n  Stopping — saving state...")
@@ -1062,7 +1209,7 @@ def run_loop():
             # Quick stop monitoring
             print(f"[{now_str}] monitoring positions...")
             try:
-                stopped = monitor_positions()
+                stopped = monitor_positions(exec_gateway=exec_gateway)
                 if stopped:
                     state = load_state()
                     print(f"  balance: ${state['balance']:,.2f}")
@@ -1091,5 +1238,39 @@ if __name__ == "__main__":
     elif cmd == "report":
         _cal = load_cal()
         print_report()
+    elif cmd == "pause-live":
+        exec_gateway = get_execution_gateway()
+        pause_file = exec_gateway.kill_switch_path()
+        pause_file.parent.mkdir(parents=True, exist_ok=True)
+        pause_file.write_text(
+            f"paused_at={datetime.now(timezone.utc).isoformat()}\n",
+            encoding="utf-8",
+        )
+        print(f"Live trading paused via {pause_file}")
+    elif cmd == "resume-live":
+        exec_gateway = get_execution_gateway()
+        pause_file = exec_gateway.kill_switch_path()
+        if pause_file.exists():
+            pause_file.unlink()
+        print(f"Live trading resumed (kill switch removed at {pause_file})")
+    elif cmd == "live-status":
+        exec_gateway = get_execution_gateway()
+        pause_file = exec_gateway.kill_switch_path()
+        print(f"mode={exec_gateway.mode_label()}")
+        print(f"kill_switch_file={pause_file}")
+        print(f"kill_switch_active={pause_file.exists()}")
+        print(f"max_live_usdc={exec_gateway.cfg.max_live_usdc}")
+        print(f"per_trade_usdc_cap={exec_gateway.cfg.per_trade_usdc_cap}")
+        print(f"max_open_exposure_usdc={exec_gateway.cfg.max_open_exposure_usdc}")
+        print(f"max_daily_loss_usdc={exec_gateway.cfg.max_daily_loss_usdc}")
+        print(f"max_new_trades_per_day={exec_gateway.cfg.max_new_trades_per_day}")
+        print(f"min_top_ask_size={exec_gateway.cfg.min_top_ask_size}")
+    elif cmd == "precip-status":
+        from precip_review import print_summary
+
+        print_summary(hours=24.0)
     else:
-        print("Usage: python weatherbet.py [run|status|report]")
+        print(
+            "Usage: python weatherbet.py "
+            "[run|status|report|pause-live|resume-live|live-status|precip-status]"
+        )

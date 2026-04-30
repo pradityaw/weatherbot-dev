@@ -1,0 +1,17 @@
+{
+  "name": "weatherbot-cursor-prelive",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prelive": "tsx prelive-review.ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.10"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
