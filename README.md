@@ -2,7 +2,7 @@
 
 Automated weather market trading bot for Polymarket. Finds mispriced temperature outcomes using real forecast data from multiple sources across 20 cities worldwide.
 
-No SDK. No black box. Pure Python.
+Pure Python bot with an optional Cursor SDK pre-live review tool under `tools/cursor-prelive/`.
 
 ---
 
@@ -13,7 +13,7 @@ The foundation. Scans 6 US cities, fetches forecasts from NWS using airport stat
 
 No math, no complexity. Just the core logic — good for understanding how the system works.
 
-### `weatherbet.py` — Full Bot (current)
+### `bot_v2.py` — Full Bot (current)
 Everything in v1, plus:
 - **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
 - **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
@@ -63,9 +63,9 @@ Every Polymarket weather market resolves on a specific airport station. NYC reso
 
 ## Installation
 ```bash
-git clone https://github.com/alteregoeth-ai/weatherbot
-cd weatherbot
-pip install requests
+git clone https://github.com/pradityaw/weatherbot-dev
+cd weatherbot-dev
+pip install -r requirements.lock.txt
 ```
 
 Create `config.json` in the project folder:
@@ -92,10 +92,13 @@ Get a free Visual Crossing API key at visualcrossing.com — used to fetch actua
 
 ## Usage
 ```bash
-python weatherbet.py           # start the bot — scans every hour
-python weatherbet.py status    # balance and open positions
-python weatherbet.py report    # full breakdown of all resolved markets
+python bot_v2.py run       # start the bot — scans every hour
+python bot_v2.py status    # balance and open positions
+python bot_v2.py report    # full breakdown of all resolved markets
 ```
+
+Live/shadow execution uses `py-clob-client` through `execution.py`. Keep
+`WEATHERBOT_DRY_RUN_LIVE=1` while validating paper/shadow behavior.
 
 ---
 
