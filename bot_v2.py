@@ -825,7 +825,9 @@ def scan_and_update(exec_gateway=None):
                                     best_signal["trader_edge_nudged"] = True
                         except Exception:
                             pass
-                        if best_signal["ev"] < MIN_EV or best_signal["cost"] < 0.50:
+                        if best_signal.get("trader_edge_nudged") and (
+                            best_signal["ev"] < MIN_EV or best_signal["cost"] < 0.50
+                        ):
                             print(
                                 f"  [SKIP] {loc['name']} {date} — trader-edge nudge "
                                 f"reduced edge below threshold"
