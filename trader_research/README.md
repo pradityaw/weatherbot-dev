@@ -48,6 +48,13 @@ After `rankings.json` exists, enable logging of trader-edge features on entry ca
 export WEATHERBOT_TRADER_EDGE=1
 ```
 
-Events are appended to `data/live_events.jsonl` as `trader_edge_snapshot` or `trader_edge_skip`. This does **not** change order sizing unless you later wire `trader_edge_prob_nudge()` into strategy code.
+Events are appended to `data/live_events.jsonl` as `trader_edge_snapshot` or `trader_edge_skip`.
+By default this is logging-only. To opt into the probability nudge that is now wired in `bot_v2.py`, set a small positive strength:
+
+```bash
+export WEATHERBOT_TRADER_EDGE_STRENGTH=0.01
+```
+
+The nudge is bounded to `[0.01, 0.99]`, recomputes EV/Kelly/size, and is skipped unless `WEATHERBOT_TRADER_EDGE=1` successfully loads trader features. It can reduce a signal below normal entry thresholds; in that case the bot skips the candidate rather than opening a weakened position.
 
 See [DATA_SOURCES.md](DATA_SOURCES.md) for API notes.

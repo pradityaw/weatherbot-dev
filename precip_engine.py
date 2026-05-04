@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Precipitation market scanner — paper signal engine (Phase 1).
+Precipitation market scanner.
 
 Discovers rain/snow/precip Polymarket markets, scores YES vs NO using Open-Meteo
 precipitation sums and normal tail probabilities, prices via CLOB bid/ask.
+By default it logs paper-only research data. When WEATHERBOT_PRECIP_PAPER_ONLY=0,
+the caller may pass an ExecutionGateway for shadow gateway evaluation.
 
 Does not import bot_v2 (avoid circular imports). Loads the same config.json keys.
 """
@@ -29,6 +31,7 @@ from clob_market import (
     get_clob_orderbook,
     resolve_market_token_id,
 )
+from signals import TradeSignal
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -911,6 +914,7 @@ def score_precip_market(
         "mid": round((bid + ask) / 2.0, 4) if bid and ask else None,
         "spread": round(spread, 4),
         "ask_size": (yes_book if side == "YES" else no_book).get("ask_size", 0.0),
+        "token_id": (yes_book if side == "YES" else no_book).get("token_id"),
         "synthetic_no": bool(clob.get("synthetic_no")),
         "ev": ev,
         "kelly": kelly,
@@ -926,7 +930,65 @@ def _precip_market_path(market_id: str) -> Path:
     return PRECIP_MARKETS_DIR / f"{market_id}.json"
 
 
-def scan_precip_and_log(now_iso: str | None = None, balance: float | None = None) -> int:
+def _precip_trade_signal(scored: dict[str, Any]) -> TradeSignal:
+    threshold = scored.get("threshold_inches")
+    low = scored.get("threshold_low_inches")
+    high = scored.get("threshold_high_inches")
+    if low is None:
+        low = threshold if threshold is not None else 0.0
+    if high is None:
+        high = threshold if threshold is not None else 999.0
+    ask = float(scored.get("ask") or 0.0)
+    size = float(scored.get("size_usdc") or 0.0)
+    return TradeSignal(
+        kind="entry",
+        ts=str(scored.get("ts") or datetime.now(timezone.utc).isoformat()),
+        city=str(scored.get("city") or "precip"),
+        city_name=str(scored.get("city_name") or scored.get("city") or "Precip"),
+        date=str(scored.get("window") or ""),
+        market_id=str(scored.get("market_id") or ""),
+        question=str(scored.get("question") or ""),
+        bucket_low=float(low),
+        bucket_high=float(high),
+        forecast_temp=float(scored.get("forecast_total_inches") or 0.0),
+        forecast_source="open_meteo_precip",
+        probability=float(scored.get("probability") or 0.0),
+        ev=float(scored.get("ev") or 0.0),
+        kelly=float(scored.get("kelly") or 0.0),
+        ask=ask,
+        bid=float(scored.get("bid") or 0.0),
+        spread=float(scored.get("spread") or 0.0),
+        size_usdc=size,
+        shares=round(size / ask, 4) if ask > 0 else 0.0,
+        reason="precip_signal",
+        strategy="precipitation",
+        outcome_side=str(scored.get("side") or "YES").upper(),
+        token_id=str(scored.get("token_id") or "") or None,
+    )
+
+
+def _evaluate_precip_gateway(scored: dict[str, Any], exec_gateway: Any) -> dict[str, Any]:
+    signal = _precip_trade_signal(scored)
+    live_enabled = bool(getattr(exec_gateway.cfg, "live_trading_enabled", False))
+    dry_run = bool(getattr(exec_gateway.cfg, "dry_run_live", True))
+    if live_enabled and not dry_run:
+        exec_gateway.ledger.log_event(
+            {
+                **signal.to_dict(),
+                "event": "precip_entry_skipped",
+                "reason": "precip_live_submission_disabled",
+                "mode": exec_gateway.mode_label(),
+            }
+        )
+        return {"submitted": False, "reason": "precip_live_submission_disabled"}
+    return exec_gateway.on_entry_signal(signal)
+
+
+def scan_precip_and_log(
+    now_iso: str | None = None,
+    balance: float | None = None,
+    exec_gateway: Any | None = None,
+) -> int:
     """
     Full precip discovery + scoring cycle. Appends one line per scored market to precip_log.jsonl.
     Returns count of log lines written.
@@ -937,10 +999,6 @@ def scan_precip_and_log(now_iso: str | None = None, balance: float | None = None
         "yes",
         "on",
     }
-    if not paper_only:
-        # Phase 2: wire ExecutionGateway + TradeSignal extensions; keep paper behavior until then.
-        pass
-
     if os.getenv("WEATHERBOT_PRECIP_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}:
         return 0
 
@@ -959,7 +1017,7 @@ def scan_precip_and_log(now_iso: str | None = None, balance: float | None = None
             if not scored:
                 continue
             scored["ts"] = ts
-            scored["paper_only"] = True
+            scored["paper_only"] = paper_only
 
             # Persist latest snapshot per market id
             mp = _precip_market_path(scored["market_id"])
@@ -967,6 +1025,13 @@ def scan_precip_and_log(now_iso: str | None = None, balance: float | None = None
 
             if scored["ev"] < MIN_EV:
                 continue
+
+            if not paper_only and scored.get("would_pass_gateway") and exec_gateway is not None:
+                try:
+                    scored["gateway_result"] = _evaluate_precip_gateway(scored, exec_gateway)
+                    mp.write_text(json.dumps(scored, indent=2, ensure_ascii=False), encoding="utf-8")
+                except Exception as exc:
+                    scored["gateway_result"] = {"submitted": False, "reason": f"gateway_error:{exc}"}
 
             line = json.dumps(scored, ensure_ascii=True)
             with PRECIP_LOG.open("a", encoding="utf-8") as f:

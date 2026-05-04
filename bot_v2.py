@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-weatherbet.py — Weather Trading Bot for Polymarket
+bot_v2.py — Weather Trading Bot for Polymarket
 =====================================================
 Tracks weather forecasts from 3 sources (ECMWF, HRRR, METAR),
 compares with Polymarket markets, paper trades using Kelly criterion.
 
 Usage:
-    python weatherbet.py          # main loop
-    python weatherbet.py report   # full report
-    python weatherbet.py status   # balance and open positions
+    python bot_v2.py          # main loop
+    python bot_v2.py report   # full report
+    python bot_v2.py status   # balance and open positions
 """
 
 import os
@@ -43,6 +43,13 @@ def _env_int(key, default):
         return int(raw)
     except ValueError:
         return int(default)
+
+
+def _env_bool(key, default=False):
+    raw = os.getenv(key)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 BALANCE          = _cfg.get("balance", 10000.0)
 MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
@@ -793,17 +800,37 @@ def scan_and_update(exec_gateway=None):
 
                     if not skip_position and best_signal["entry_price"] < MAX_PRICE:
                         try:
-                            from trader_research.trader_edge import maybe_log_trader_edge
+                            from trader_research.trader_edge import (
+                                maybe_log_trader_edge,
+                                trader_edge_prob_nudge,
+                            )
 
-                            maybe_log_trader_edge(
+                            edge_features = maybe_log_trader_edge(
                                 exec_gateway,
                                 city_slug=city_slug,
                                 date_str=date,
                                 matched_outcome=o,
                                 best_signal=best_signal,
                             )
+                            if edge_features:
+                                nudged_p = trader_edge_prob_nudge(best_signal["p"], edge_features)
+                                if nudged_p != best_signal["p"]:
+                                    best_signal["p"] = round(nudged_p, 4)
+                                    best_signal["ev"] = round(calc_ev(nudged_p, best_signal["entry_price"]), 4)
+                                    best_signal["kelly"] = round(calc_kelly(nudged_p, best_signal["entry_price"]), 4)
+                                    best_signal["cost"] = bet_size(best_signal["kelly"], balance)
+                                    best_signal["shares"] = round(
+                                        best_signal["cost"] / best_signal["entry_price"], 2
+                                    )
+                                    best_signal["trader_edge_nudged"] = True
                         except Exception:
                             pass
+                        if best_signal["ev"] < MIN_EV or best_signal["cost"] < 0.50:
+                            print(
+                                f"  [SKIP] {loc['name']} {date} — trader-edge nudge "
+                                f"reduced edge below threshold"
+                            )
+                            continue
                         trade_signal = TradeSignal.from_best_signal(
                             city=city_slug,
                             city_name=loc["name"],
@@ -1184,10 +1211,16 @@ def run_loop():
                         precip_n = scan_precip_and_log(
                             now_iso=datetime.now(timezone.utc).isoformat(),
                             balance=bal,
+                            exec_gateway=exec_gateway,
+                        )
+                        precip_mode = (
+                            "paper-only"
+                            if _env_bool("WEATHERBOT_PRECIP_PAPER_ONLY", True)
+                            else "gateway-shadow"
                         )
                         print(
                             f"  precip: {precip_n} signal(s) logged "
-                            f"(ev>={MIN_EV}, paper-only)"
+                            f"(ev>={MIN_EV}, {precip_mode})"
                         )
                     except Exception as exc:
                         print(f"  precip scan error: {exc}")
@@ -1271,6 +1304,6 @@ if __name__ == "__main__":
         print_summary(hours=24.0)
     else:
         print(
-            "Usage: python weatherbet.py "
+            "Usage: python bot_v2.py "
             "[run|status|report|pause-live|resume-live|live-status|precip-status]"
         )

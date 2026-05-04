@@ -32,7 +32,7 @@ Observed behavior:
   - `https://gamma-api.polymarket.com`
   - `https://weather.visualcrossing.com`
   - `https://api.weather.gov` in `bot_v1.py`
-- The bot is paper-only. It does not sign transactions, use a private key, or submit live Polymarket orders.
+- The default path is paper/shadow. Guarded live CLOB entry submission exists in `execution.py` and requires explicit live env flags plus credentials.
 
 Local write surface:
 - `data/state.json`
@@ -43,7 +43,7 @@ Local write surface:
 
 ## Notes
 
-- The README refers to `weatherbet.py`, but the actual full bot file in the repo is `bot_v2.py`.
+- The full bot entrypoint is `bot_v2.py`.
 - Self-learning requires a Visual Crossing API key. Without `WEATHERBOT_VC_KEY` or a real `vc_key` in `config.json`, the bot still scans and paper-trades, but it cannot fetch final observed temperatures for calibration.
 
 ## Local hardening added

@@ -2,7 +2,7 @@
 Shadow-only trader-edge context for live bot runs.
 
 Set WEATHERBOT_TRADER_EDGE=1 to log consensus features for the matched bucket.
-Does not change sizing or override trades unless extended later.
+Set WEATHERBOT_TRADER_EDGE_STRENGTH > 0 to opt into a small probability nudge.
 
 Requires prior offline pipeline:
   python -m trader_research.collect ...
@@ -110,10 +110,10 @@ def maybe_log_trader_edge(
     date_str: str,
     matched_outcome: dict[str, Any],
     best_signal: dict[str, Any],
-) -> None:
-    """Log trader-edge snapshot to live_events.jsonl (shadow research)."""
+) -> dict[str, Any] | None:
+    """Log trader-edge snapshot to live_events.jsonl and return features for optional sizing nudges."""
     if not _env_bool("WEATHERBOT_TRADER_EDGE"):
-        return
+        return None
 
     cid = str(matched_outcome.get("condition_id") or "").strip()
     if not cid:
@@ -126,7 +126,7 @@ def maybe_log_trader_edge(
                 "market_id": best_signal.get("market_id"),
             }
         )
-        return
+        return None
 
     try:
         top_n = int(os.getenv("WEATHERBOT_TRADER_EDGE_TOP_N", "15"))
@@ -143,7 +143,7 @@ def maybe_log_trader_edge(
                 "condition_id": cid,
             }
         )
-        return
+        return None
 
     try:
         feats = compute_edge_features(cid, tops)
@@ -157,7 +157,7 @@ def maybe_log_trader_edge(
                 "condition_id": cid,
             }
         )
-        return
+        return None
 
     exec_gateway.ledger.log_event(
         {
@@ -171,6 +171,7 @@ def maybe_log_trader_edge(
             **feats,
         }
     )
+    return feats
 
 
 def trader_edge_prob_nudge(
@@ -179,7 +180,7 @@ def trader_edge_prob_nudge(
     *,
     strength: float | None = None,
 ) -> float:
-    """Optional probability nudge for future hybrid mode (not wired by default)."""
+    """Optionally nudge probability when WEATHERBOT_TRADER_EDGE_STRENGTH is positive."""
     s = strength
     if s is None:
         try:
@@ -187,6 +188,8 @@ def trader_edge_prob_nudge(
         except ValueError:
             s = 0.0
     if s <= 0:
+        return p
+    if not edge_features.get("active_top_traders"):
         return p
     score = float(edge_features.get("net_yes_minus_no_score", 0))
     # squash score roughly into [-1,1]
